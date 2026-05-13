@@ -5,8 +5,7 @@ asks an AI to score each merge/pull request's risk, posts a single
 markdown comment per head SHA explaining the verdict, and optionally
 auto-approves / auto-merges trivial low-risk changes.
 
-This repo is the author's working copy targeting an internal Indeed
-GitLab. Most users will need to strip out the Indeed-specific bits
+This repo is currently configured to read GitLab. Most users will need to customize it
 before running it. There's a one-shot AI prompt below that does that
 for you.
 
