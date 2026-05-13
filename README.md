@@ -22,9 +22,7 @@ edits needed to turn this into a generic bot for your provider.
 >
 > ~~~
 > You are helping me adapt this merge-request-bot codebase for my own
-> environment. It currently has Indeed-specific assumptions (an Indeed
-> compliance flag called JSOX_COMPLIANCE, a sibling-repo `danbot` that
-> supplies the project list, and hard-coded Indeed GitLab URLs). I
+> environment. It currently has assumptions that don't necessarily match what I need. I
 > want a clean, generic bot.
 >
 > STEP 1 — Ask me these setup questions, then wait for my answers
@@ -46,7 +44,7 @@ edits needed to turn this into a generic bot for your provider.
 >
 > STEP 2 — Once I've answered, make these edits:
 >
-> Remove all Indeed-specific code and config:
+> Remove all aummptions about the code and config:
 >   * In `src/mrbot/config.py`:
 >     - delete `DANBOT_ENV_PATH`, `danbot_env_path` field,
 >       `_read_project_repo_map_from_danbot_env`, the
@@ -69,7 +67,7 @@ edits needed to turn this into a generic bot for your provider.
 >             `cfg.allow_auto_approve` and author != current user.
 >       (iii) same as (ii), plus merge when `verdict.is_trivial` and
 >             CI is in {success, skipped, none} and `cfg.allow_auto_merge`.
->   * Strip the `JIRA_*` block from `.env.example` (Indeed-only, the
+>   * Strip the `JIRA_*` block from `.env.example` (the
 >     bot doesn't actually use it).
 >   * Update default `GITLAB_BASE_URL` in `config.py` and `.env.example`
 >     to my answer from 1b.
@@ -123,9 +121,9 @@ edits needed to turn this into a generic bot for your provider.
 >     short note saying "this codebase has been customized for
 >     <provider> at <base_url>".
 >   * Update the Quick start to use the new `<PROVIDER>_TOKEN` env var.
->   * Update the "What it does" section to drop Indeed/JSOX language.
+>   * Update the "What it does" section to drop JSOX language.
 >
-> STEP 5 — Update `PLAN.md` to reflect the new (non-Indeed) shape:
+> STEP 5 — Update `PLAN.md` to reflect the new (generic) shape:
 >   * Drop the JSOX section.
 >   * Replace `PROJECT_REPO_MAP` / `DANBOT_ENV_PATH` /
 >     `LOCAL_REPO_BASE_PATH` discussion with the simpler `WATCH_REPOS`
