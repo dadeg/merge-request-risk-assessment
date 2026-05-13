@@ -12,20 +12,28 @@ from __future__ import annotations
 import json
 import logging
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from . import comment, gate, jsox, risk
+from . import comment, gate, risk
 from .actions import approve as approve_action
 from .actions import merge as merge_action
 from .actions import post_comment
 from .config import Config
 from .gatherer import MRContext, gather
 from .gitlab.client import GitLabClient, GitLabError
-from .project_resolver import resolve_all
 from .state.store import Store
 
 log = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class WatchedProject:
+    """A repo we successfully resolved on GitLab."""
+
+    path_with_namespace: str
+    project_id: int
 
 
 def _audit(audit_path: Path, payload: dict[str, Any]) -> None:
@@ -56,9 +64,9 @@ def _verdict_payload(v: risk.Verdict | None) -> dict[str, Any]:
     }
 
 
-# CI states under which we're willing to auto-merge. We're stricter here
-# than for posting comments: we won't merge into a target branch if the
-# pipeline failed, was canceled, or is still waiting for human input.
+# CI states under which we're willing to auto-merge. Stricter than for
+# posting comments: we won't merge if the pipeline failed, was canceled,
+# or is still waiting for human input.
 _CI_OK_FOR_MERGE = frozenset({"success", "skipped", "none"})
 
 
@@ -121,22 +129,14 @@ def _maybe_auto_act(
     Returns a list of action names that succeeded — e.g. `["approved",
     "merged"]` or `[]` — for the caller to fold into a single INFO log.
 
-    JSOX is a compliance regime — JSOX-compliant repos normally require
-    human approvals. But trivial changes (tests/docs/comments only)
-    don't touch any code under the JSOX umbrella, so they bypass the
-    compliance gate entirely.
-
     Eligibility for AUTO-APPROVE (all must hold):
       - ALLOW_AUTO_APPROVE
       - verdict.risk == "low"
       - author is not the current user (GitLab forbids self-approval)
-      - verdict.is_trivial OR project explicitly declares
-        `JSOX_COMPLIANCE: false|0|no|off`
 
     Additional gate for AUTO-MERGE:
       - ALLOW_AUTO_MERGE
-      - verdict.is_trivial (regardless of JSOX status — non-trivial
-        changes never auto-merge, even in JSOX-exempt repos)
+      - verdict.is_trivial (only test/doc/comment changes)
       - CI is in {success, skipped, none}
     """
     actions: list[str] = []
@@ -154,45 +154,22 @@ def _maybe_auto_act(
         )
         return actions
 
-    is_trivial = verdict.is_trivial
-    # Skip the JSOX file fetch for trivial MRs — they bypass the gate.
-    jsox_exempt = (
-        False
-        if is_trivial
-        else jsox.is_project_safe_for_auto_action(client, ctx.project_id, ctx.head_sha)
-    )
-    if not (is_trivial or jsox_exempt):
-        log.debug(
-            "%s!%s low-risk non-trivial in JSOX-required repo; comment-only",
-            ctx.project_path,
-            ctx.mr_iid,
-        )
-        return actions
-
-    basis = "trivial" if is_trivial else "jsox-exempt"
-
     if cfg.allow_auto_approve:
         try:
             approve_action.post(client, ctx.project_id, ctx.mr_iid, ctx.head_sha)
             actions.append("approved")
-            _audit(
-                audit_path,
-                _action_audit_payload(ctx, verdict, action="approved", basis=basis),
-            )
+            _audit(audit_path, _action_audit_payload(ctx, verdict, action="approved"))
         except GitLabError as e:
             log.error("approval failed for %s!%s: %s", ctx.project_path, ctx.mr_iid, e)
             _audit(
                 audit_path,
-                _action_audit_payload(
-                    ctx, verdict, action="approve_failed", reason=str(e), basis=basis
-                ),
+                _action_audit_payload(ctx, verdict, action="approve_failed", reason=str(e)),
             )
             return actions
 
     if not cfg.allow_auto_merge:
         return actions
-    # Auto-merge always requires triviality, regardless of JSOX status.
-    if not is_trivial:
+    if not verdict.is_trivial:
         return actions
     if ctx.ci_state not in _CI_OK_FOR_MERGE:
         log.info(
@@ -208,7 +185,6 @@ def _maybe_auto_act(
                 verdict,
                 action="merge_skipped_ci",
                 reason=f"CI state {ctx.ci_state!r} not in {sorted(_CI_OK_FOR_MERGE)}",
-                basis=basis,
             ),
         )
         return actions
@@ -216,17 +192,12 @@ def _maybe_auto_act(
     try:
         merge_action.post(client, ctx.project_id, ctx.mr_iid, ctx.head_sha)
         actions.append("merged")
-        _audit(
-            audit_path,
-            _action_audit_payload(ctx, verdict, action="merged", basis=basis),
-        )
+        _audit(audit_path, _action_audit_payload(ctx, verdict, action="merged"))
     except GitLabError as e:
         log.error("auto-merge failed for %s!%s: %s", ctx.project_path, ctx.mr_iid, e)
         _audit(
             audit_path,
-            _action_audit_payload(
-                ctx, verdict, action="merge_failed", reason=str(e), basis=basis
-            ),
+            _action_audit_payload(ctx, verdict, action="merge_failed", reason=str(e)),
         )
 
     return actions
@@ -238,18 +209,12 @@ def _action_audit_payload(
     *,
     action: str,
     reason: str = "",
-    basis: str = "",
 ) -> dict[str, Any]:
-    """Build an audit-log entry for an approval / merge attempt.
-
-    `basis` records WHY the auto-action was eligible — "trivial" or
-    "jsox-exempt" — so a compliance audit can quickly distinguish them.
-    """
+    """Build an audit-log entry for an approval / merge attempt."""
     return {
         "ts": int(time.time()),
         "decision": action,
         "reason": reason,
-        "auto_action_basis": basis,
         "project_id": ctx.project_id,
         "project_path": ctx.project_path,
         "mr_iid": ctx.mr_iid,
@@ -269,6 +234,30 @@ def _resolve_user_id(cfg: Config, client: GitLabClient) -> int:
     uid = int(me["id"])
     log.info("resolved current user @%s id=%s", me.get("username"), uid)
     return uid
+
+
+def _resolve_watch_repos(client: GitLabClient, paths: list[str]) -> list[WatchedProject]:
+    """Look each `group/repo` path up via the GitLab API and return the
+    set we could resolve. Logs a warning for each path the token can't see."""
+    out: list[WatchedProject] = []
+    for path in paths:
+        try:
+            project = client.get_project(path)
+        except GitLabError as e:
+            log.warning("could not resolve repo %r: %s", path, e)
+            continue
+        out.append(
+            WatchedProject(
+                path_with_namespace=str(project.get("path_with_namespace") or path),
+                project_id=int(project["id"]),
+            )
+        )
+        log.info(
+            "watching %s (id=%s)",
+            project.get("path_with_namespace") or path,
+            project.get("id"),
+        )
+    return out
 
 
 def _process_mr(
@@ -402,11 +391,10 @@ def _process_mr(
 
 
 def run_forever(cfg: Config) -> None:
-    if not cfg.project_repo_map:
+    if not cfg.watch_repos:
         raise RuntimeError(
-            "PROJECT_REPO_MAP is empty. Set it in .env (same JSON shape as "
-            "danbot's PROJECT_REPO_MAP), or leave it blank to use the bundled "
-            "default list."
+            "WATCH_REPOS is empty. Set it in .env to a comma-separated list of "
+            "GitLab project paths, e.g. WATCH_REPOS=group/repo1,group/sub/repo2"
         )
 
     store = Store(cfg.state_db_path)
@@ -414,17 +402,11 @@ def run_forever(cfg: Config) -> None:
 
     with GitLabClient(cfg.gitlab_base_url, cfg.gitlab_token) as client:
         current_user_id = _resolve_user_id(cfg, client)
-        log.info(
-            "PROJECT_REPO_MAP source: %s (%d repos)",
-            cfg.project_repo_map_source,
-            len(cfg.project_repo_map),
-        )
-        projects = resolve_all(client, cfg.project_repo_map, cfg.local_repo_base_path)
+        projects = _resolve_watch_repos(client, cfg.watch_repos)
         if not projects:
             raise RuntimeError(
-                "No projects from PROJECT_REPO_MAP could be resolved. Either "
-                "clone them under LOCAL_REPO_BASE_PATH or check that your "
-                "GitLab token can see them."
+                "No projects from WATCH_REPOS could be resolved. Check the paths "
+                "and that your GitLab token has access to them."
             )
 
         log.info(
